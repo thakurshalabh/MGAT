@@ -1,0 +1,124 @@
+##### Module to Initialize the global variable for denovo protein family prediction#####
+##### Author: Shalabh Thakur ################
+##### Date: 6-AUG-2013 #####################
+
+#!/usr/bin/perl
+package Initialize;
+
+use strict;
+use warnings;
+use Env;
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use Cluster;
+use File::Basename;
+use BIO::AlignIO
+
+use vars qw(@ISA @EXPORT @EXPORT_OK);
+
+@ISA   = qw(Exporter);
+@EXPORT= ();
+@EXPORT_OK = qw(check_input);
+
+
+sub check_input {
+
+    my %config_param=%{(shift)};
+    my %out_dir=%{(shift)};
+    my(%sequence)=%{(shift)};
+    my $cluster_file='';
+    my %group_gene=(); 
+    my %group_distance=();  
+    my %model_gene=(); 
+    my %homologue_group=();
+    my $cluster_num=0;
+
+    ######### CLUSTER FILE #######
+    if($config_param{GROUP}->{GROUP_CLUSTER_FILE} and -e "$config_param{GROUP}->{GROUP_CLUSTER_FILE}"){
+       $cluster_file=$config_param{GROUP}->{GROUP_CLUSTER_FILE};
+       my($homologue_group,$query_status)=Cluster::read_cluster($cluster_file,'xxx'); 
+       $cluster_num=keys %{$homologue_group};
+       %homologue_group=%{$homologue_group};
+       ###### Initialize group_gene hash table #############
+       foreach my $group_id(keys %homologue_group){          
+            my $gene_list=$homologue_group{$group_id};
+            my @gene_list=split("\t",$gene_list);            
+            foreach(@gene_list){
+                $group_gene{$_}=$_;               
+            } 
+       }     
+    }else{
+      print STDERR "CLUSTER FILE [$config_param{GROUP}->{GROUP_CLUSTER_FILE}] cannot be found, please check again\n"; exit;
+    } 
+
+    ######### ALIGNMENT FILE ######
+    if($config_param{GROUP}->{GROUP_ALIGNMENT_DIR} and -d "$config_param{GROUP}->{GROUP_ALIGNMENT_DIR}"){
+        my $num_aln_file=`ls -1 $config_param{GROUP}->{GROUP_ALIGNMENT_DIR} | wc -l`;
+           chomp($num_aln_file);
+        if($num_aln_file ne $cluster_num){          
+           print STDERR "Number of alignment files donot match with number of clusters\n"; exit;
+        }else{
+            print "Copying Alignment file to the project directory\n";
+            system("ls -d -1 $config_param{GROUP}->{GROUP_ALIGNMENT_DIR}/* | xargs cp -t $out_dir{aln_dir}") or die "cannot copy alignment files\n";
+
+            print "Fetching Model Sequences from Alignment\n";
+            opendir(ALN,"$out_dir{aln_dir}"); 
+    
+            while(<ALN>){
+              
+              my $group_id=$_;
+              $group_id=~s/\.(\w+)//g;
+              my @aln_seq=();
+               
+              my $in=Bio::AlignIO->new(-file=>"$out_dir{aln_dir}/$_",
+                                            -format=> "fasta"
+                                         );
+              my $alnObj=$in->next_aln();  
+              $model_gene{$group_id}=$alnObj;                   
+            }                        
+        }
+    }elsif($config_param{GROUP}->{GROUP_ALIGNMENT_DIR} and !-d "$config_param{GROUP}->{GROUP_ALIGNMENT_DIR}"){
+        print STDERR " Alignment Directory [$config_param{GROUP}->{GROUP_ALIGNMENT_DIR}] cannot be found, please check again\n"; exit;
+    }
+
+    ######### HMM MODELS and SINGLETON GROUP FILE #####   
+    if(($config_param{GROUP}->{GROUP_MODEL_DIR} and -d "$config_param{GROUP}->{GROUP_MODEL_DIR}") and ($config_param{GROUP}->{GROUP_SINGLETON_DIR} and -d "$config_param{GROUP}->{GROUP_SINGLETON_DIR}")){
+        my $num_model_file=`ls -1 $config_param{GROUP}->{GROUP_MODEL_DIR} | wc -l`;
+        my $num_singleton_file=`ls -1 $config_param{GROUP}->{GROUP_SINGLETON_DIR} | wc -l`;
+           chomp($num_model_file);
+           chomp($num_singleton_file);
+        my $total_hmm_file=$num_model_file + $num_singleton_file;
+        if($total_hmm_file ne $cluster_num){
+           print STDERR "Number of HMM files donot match with number of clusters\n"; exit;
+        }else{
+            print "Copying HMM file to the project directory\n";
+            system("ls -d -1 $config_param{GROUP}->{GROUP_MODEL_DIR}/* | xargs cp -t $out_dir{hmm_file_dir}") or die "cannot copy hmm model files\n";
+            
+            print "Copying SINGLETON files to the project directory\n";
+            system("ls -d -1 $config_param{GROUP}->{GROUP_SINGLETON_DIR}/* | xargs cp -t $out_dir{singleton_group}") or die "cannot copy singleton model files\n";
+        }
+    }elsif($config_param{GROUP}->{GROUP_MODEL_DIR} and !-d "$config_param{GROUP}->{GROUP_ALIGNMENT_DIR}"){
+        print STDERR "MODEL Directory [$config_param{GROUP}->{GROUP_MODEL_DIR}] cannot be found, please check again\n"; exit;
+    }elsif($config_param{GROUP}->{GROUP_SINGLETON_DIR} and  !-d "$config_param{GROUP}->{GROUP_SINGLETON_DIR}"){
+        print STDERR "SINGLETON Directory [$config_param{GROUP}->{GROUP_SINGLETON_DIR}] cannot be found, please check again\n"; exit;
+    }
+
+    ######## DISTANCE FILE #######
+    if($config_param{GROUP}->{GROUP_DISTANCE_FILE} and -e "$config_param{GROUP}->{GROUP_DISTANCE_FILE}"){
+      system("cp $config_param{GROUP}->{GROUP_DISTANCE_FILE} $out_dir{distance_file}") or die "Cannot copy distance file\n";
+       my $distance_file=basename("$config_param{GROUP}->{GROUP_DISTANCE_FILE}");
+       print "Reading Distance Table for the Cluster\n";
+       open(GROUP_DISTANCE,"$out_dir{distance_file}/$distance_file") or die "Cannot open distance file\n";
+       foreach(<GROUP_DISTANCE>){
+            my @pair=split(' ',$_); 
+            chomp($pair[3]);          
+            $group_distance{$pair[0]}->{total_group_distance}=$pair[1];
+            $group_distance{$pair[0]}->{average_group_distance}=$pair[2];
+            $group_distance{$pair[0]}->{number_pair}=$pair[3];
+       }       
+    }elsif($config_param{GROUP}->{GROUP_DISTANCE_FILE} and !-e "$config_param{GROUP}->{GROUP_DISTANCE_FILE}"){
+       print STDERR "DISTANCE FILE [$config_param{GROUP}->{GROUP_DISTANCE_FILE}] cannot be found, please check again\n"; exit;
+    }    
+  
+   return($cluster_file,\%group_gene,\%group_distance,\%homologue_group,\%model_gene);
+}

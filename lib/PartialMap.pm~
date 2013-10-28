@@ -1,0 +1,294 @@
+##### Module to Map Partial Sequence#####
+##### Author: Shalabh Thakur ################
+##### Date: 23-AUG-2013 #####################
+
+#!/usr/bin/perl
+package PartialMap;
+
+use strict;
+use warnings;
+use Env;
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use Cluster;
+use MclClustering;
+use Parallel::ForkManager;
+
+use vars qw(@ISA @EXPORT @EXPORT_OK);
+
+@ISA   = qw(Exporter);
+@EXPORT= ();
+@EXPORT_OK = qw(mapPartialSequence);
+
+
+sub mapPartialSequence {
+
+    my($group_file)=(shift);
+    my(%out_dir)=%{(shift)};
+    my($seq_len_table)=(shift);
+    my($mcl)=(shift);
+    
+    ######## Combine all similarity pairs for all processed genomes ######    
+    system("ls -d -1 $out_dir{all_similarity_dir}/* | xargs cat > $out_dir{mcl_dir}/all_similarity_pairs.txt");
+
+    ######## Read genes for each homologue group #########################
+    my($homolog_group,$query_status)=Cluster::read_cluster($group_file,'xxx'); 
+
+    ######## Read Group id for each gene #################################
+    my($groupforgene)=Cluster::readGroupForGene($group_file); 
+
+    my($grouplength)=Cluster::getGroupLength($homolog_group,$seq_len_table);
+
+    ######## Parse all similarity file to find best partial and full length match #####
+
+    my $similarity_file=parseAllSimilarity("$out_dir{mcl_dir}/all_similarity_pairs.txt",$out_dir{mcl_dir});
+
+    ######## Mcl cluster all similarity pairs ############################
+    my $mcl_output=MclClustering::run_mcl($similarity_file,$mcl,$out_dir{mcl_dir});
+
+    open(MCL_OUT,"$out_dir{mcl_dir}/$mcl_output");
+    my @mcl_groups=<MCL_OUT>;
+
+    ####### Count refine groups for each cluster line ###################
+    my $homolog_cluster_file=mapHomologGroup(\@mcl_groups,$groupforgene,$homolog_group,\%out_dir);
+}
+
+##### Parse All Similarity File ######
+
+sub parseAllSimilarity {
+
+    my($all_similarity_file)=(shift);
+    my($mcl_dir)=(shift);
+    my($similarity_file)="parsed_all_similarity.txt";
+
+    open(ALL_SIM,"$all_similarity_file");
+    my @all_sim_line=<ALL_SIM>;
+
+    open(PARSE_SIM,">$mcl_dir/$similarity_file");
+
+    ##### Splits similarity line and store each column as array ####
+    my @similarity_column=map{[split(' ',$_)]} @all_sim_line;   
+
+    my @sortedbyqueryevalue=sort{$a->[0] cmp $b->[0] ||
+                                 $a->[10] <=> $b->[10]
+                                 } @similarity_column;
+
+    my @sortedbytargetscore=sort{$a->[1] cmp $b->[1] ||
+                                $b->[11] <=> $a->[11]
+                               } @similarity_column; 
+
+    ###### If Query is shorter than target ######
+    ###### Filter each query with the best matching group with lowest e-value ###
+
+    my %previous_query=();
+    my %truncated_query=();
+
+    foreach my $line(@sortedbyqueryevalue){
+
+         my @column=@{$line};
+         my $query_name=$column[0];
+         my $target_name=$column[1];
+         my $qlen=$column[2];
+         my $slen=$column[3];
+         my $evalue=$column[10];
+         my $score=$column[11];
+
+         my $merged_column=join("\t",@column);
+         my @evalue_bitscore=();
+
+         if(($qlen<$slen) and ($merged_column=~/(TRUNCATED)/)){
+
+             if($previous_query{$query_name}){
+
+                 if($evalue<$previous_query{$query_name}->[0]){
+                    $truncated_query{$query_name}=$merged_column;
+                    push(@evalue_bitscore,$evalue);
+                    push(@evalue_bitscore,$score);
+                    $previous_query{$query_name}=\@evalue_bitscore;
+                  
+                 }elsif($evalue eq $previous_query{$query_name}->[0]){
+                    
+                      if($score> $previous_query{$query_name}->[1]){
+                          $truncated_query{$query_name}=$merged_column;
+                          push(@evalue_bitscore,$evalue);
+                          push(@evalue_bitscore,$score);
+                          $previous_query{$query_name}=\@evalue_bitscore;
+                      }
+                 }                          
+             }else{
+                  $truncated_query{$query_name}=$merged_column;
+                  push(@evalue_bitscore,$evalue);
+                  push(@evalue_bitscore,$score);
+                  $previous_query{$query_name}=\@evalue_bitscore; 
+             }                
+         }elsif(($merged_column=~/(BEST)/) or ($merged_column=~/(SINGLETON)/)){
+             print PARSE_SIM "$merged_column\n";
+         }      
+    }  
+
+    foreach(keys %truncated_query){
+         print PARSE_SIM "$truncated_query{$_}\n";
+    }
+     
+    ##### IF Query is Longer than Target #############
+    ##### Filter target group with best match query having highest bit score ####
+    my %previous_target=();
+    my %truncated_target=();
+
+    foreach my $line(@sortedbytargetscore){
+
+         my @column=@{$line};
+         my $query_name=$column[0];
+         my $target_name=$column[1];
+         my $qlen=$column[2];
+         my $slen=$column[3];
+         my $evalue=$column[10];
+         my $score=$column[11];
+
+         my $merged_column=join("\t",@column);
+         my @evalue_bitscore=();
+
+         if(($qlen>$slen) and ($merged_column=~/(TRUNCATED)/)){           
+            
+             if($previous_target{$target_name}){
+
+                 if($score>$previous_target{$target_name}->[1]){
+                    $truncated_target{$target_name}=$merged_column;
+                    push(@evalue_bitscore,$evalue);
+                    push(@evalue_bitscore,$score);
+                    $previous_target{$target_name}=\@evalue_bitscore;                  
+                 }                   
+             }else{
+                  $truncated_target{$target_name}=$merged_column;
+                  push(@evalue_bitscore,$evalue);
+                  push(@evalue_bitscore,$score);
+                  $previous_target{$target_name}=\@evalue_bitscore; 
+             }                
+         }    
+    }  
+
+    foreach(keys %truncated_target){
+         print PARSE_SIM "$truncated_target{$_}\n";
+    }
+
+    close PARSE_SIM;
+
+  return($similarity_file);  
+}
+
+##### Map Homologue group on UnRefined Group  do single linkage clustering###########
+
+sub mapHomologGroup {
+
+    my(@mcl_group)=@{(shift)};
+    my(%groupforgene)=%{(shift)};
+    my(%homolog_group)=%{(shift)};
+    my(%out_dir)=%{(shift)};
+   
+    my $line_number=1; 
+    my %grouponline=();
+   
+    ###### map group_id on the unrefine_cluster #######
+    print "Map Refine Groups\n";
+
+    foreach my $group_line(@mcl_group){
+
+        chomp($group_line);
+
+        my @unrefine_group=split(' ',$group_line);              
+              
+        foreach my $gene_id(@unrefine_group){ 
+            chomp($gene_id);   
+            $gene_id=~s/\s+//g;
+                   
+            my $groupforgene=$groupforgene{$gene_id};                   
+
+            if(!defined($groupforgene)){ 
+                $groupforgene=$gene_id;                                                                     
+            }
+            $grouponline{$line_number}->{$groupforgene}=1;                                                  
+        }                      
+        $line_number++;               
+    }
+
+    ########## Merge groups related by atleast single linkage ##########
+    print "Start Single Linkage Clustering\n";
+
+    #open(MAP_CLUSTER,">$out_dir{homolog_dir}/map_cluster.txt");
+    my $homolog_cluster_file="$out_dir{homolog_dir}/homolog_cluster.txt";
+
+    open(MAP_GENE,">$homolog_cluster_file");
+
+    my $cluster_number=1;
+
+    NEW_CLUSTER:
+
+    print "Start clustering for cluster number $cluster_number\n";
+
+    my %cluster=();
+
+    UPDATE_CLUSTER:    
+    print "Scan Groups\n";
+    foreach my $group_line(sort {$a<=>$b} keys %grouponline){
+
+            my %linked_groups=%{$grouponline{$group_line}};
+            my $havelink=0; 
+            my $cluster_size=keys %cluster; 
+
+            ##### If new cluster add 1st group line to new cluster #####
+            if($cluster_size eq 0) {
+           
+               foreach my $group(keys %linked_groups){
+                  chomp($group); 
+                  print "$group_line\t $group\n";
+                  $cluster{$group}=$cluster_number;                  
+               }
+               delete($grouponline{$group_line});
+               goto UPDATE_CLUSTER;  
+            
+            }else { ###### check for the next group that has link to current cluster ####
+                foreach my $group(keys %linked_groups){ 
+                   chomp($group);     
+                   if(defined($cluster{$group})){
+                      $havelink=1;                      
+                   }
+                }
+                #### If link found in cluster, add the group line to the cluster and rescan ####
+                if($havelink eq 1){
+                   foreach my $group(keys %linked_groups){
+                      chomp($group); 
+                      print "$group_line\t $group\n";
+                      $cluster{$group}=$cluster_number;                  
+                   }
+                   delete($grouponline{$group_line});
+                   goto UPDATE_CLUSTER;  
+                }                
+            }                 
+    }    
+    ###### PRINT SINGLE LINKAGE CLUSTER ######    
+
+    #print MAP_CLUSTER "Cluster_$cluster_number:\t";
+
+    print MAP_GENE "HomologCluster_$cluster_number:\t";
+
+    foreach my $group(keys %cluster){
+        #print MAP_CLUSTER "$group\t";
+
+        print MAP_GENE "$homolog_group{$group}\t";
+    }
+    #print MAP_CLUSTER "\n"; 
+   
+    print MAP_GENE "\n"; 
+
+    $cluster_number++;
+
+    my $size_grouponline=keys %grouponline;
+
+    print "Remaining to be cluster $size_grouponline\n";
+
+    if($size_grouponline ne 0){
+       goto NEW_CLUSTER;
+    }  
+  
+  return($homolog_cluster_file); 
+}  

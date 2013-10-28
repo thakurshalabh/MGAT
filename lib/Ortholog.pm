@@ -1,0 +1,706 @@
+##### Module to Predict Ortholog Genes #######
+##### Author: Shalabh Thakur #################
+##### Date: 28-SEP-2013 ######################
+
+#!/usr/bin/perl
+package Ortholog;
+
+use strict;
+use warnings;
+use threads;
+use threads::shared;
+use Env;
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use Bio::Tools::Phylo::Phylip::ProtDist;
+use Bio::AlignIO;
+use Bio::SeqIO;
+use Cluster;
+use Hash::Merge qw( merge );
+use File::Path qw(remove_tree);
+use Parallel::ForkManager;
+
+
+use vars qw(@ISA @EXPORT @EXPORT_OK);
+
+@ISA   = qw(Exporter);
+@EXPORT= ();
+@EXPORT_OK = qw(predict_ortholog);
+
+
+sub predict_ortholog {
+
+my($homolog_cluster_file)=(shift);
+my($group_file)=(shift);
+my($muscle)=(shift);
+my($protdist)=(shift);
+my(%out_dir)=%{(shift)};
+my(%sequence)=%{(shift)};
+my(%query_genome)=%{(shift)};
+my(%reference_genome)=%{(shift)};
+
+my $process=3;
+
+my($homolog_cluster,$query_status)=Cluster::read_cluster($homolog_cluster_file,'xxx');
+
+my($groupforgene)=Cluster::readGroupForGene($group_file); 
+
+my(%homolog_cluster)=%{($homolog_cluster)};
+
+my(%groupforgene)=%{($groupforgene)};
+
+my $count_cluster=keys(%homolog_cluster);
+
+  my $fork=Parallel::ForkManager->new($process); 
+
+  foreach my $cluster_id(sort keys %homolog_cluster){
+
+     $fork->start and next;   
+              
+     my $completed_cluster=process_each_cluster(\%homolog_cluster,\%sequence,\%groupforgene,$cluster_id,\%out_dir,$muscle,$protdist);
+         
+     print "$completed_cluster completed\n";
+     $fork->finish;     
+  }
+  $fork->wait_all_children;
+}
+
+###### PROCESS EACH CLUSTER ############
+
+sub process_each_cluster {
+
+   my(%homolog_cluster)=%{(shift)};
+   my(%sequence)=%{(shift)};
+   my(%groupforgene)=%{(shift)};
+   my($cluster_id)=(shift);
+   my(%out_dir)=%{(shift)};
+   my($muscle)=(shift);
+   my($protdist)=(shift);
+
+   my %distance_pair=();
+   my %outgroup_pair=();
+   my %alignment_type=();
+
+   print "$cluster_id\n";
+
+   my $cluster_gene=$homolog_cluster{$cluster_id};
+
+   my @cluster_gene=split(' ',$cluster_gene);
+
+   mkdir("$out_dir{tmp_log}/$cluster_id");
+
+   ##### FASTA SEQUENCE FOR CLUSTER ####      
+   open(TMP_LOG,">$out_dir{tmp_log}/$cluster_id/$cluster_id.fasta");
+
+   my $num_genes=scalar(@cluster_gene);
+
+   foreach my $gene_id(@cluster_gene){
+
+       $gene_id=~/(\w+)(\|)(.+)/;
+
+       my $gene_seq=$sequence{$1}->{$gene_id};
+          $gene_seq=~s/\*//g;
+
+       my $group_id=$groupforgene{$gene_id};
+
+       print TMP_LOG ">$gene_id\n$gene_seq\n";
+   }
+
+   ##### MULTIPLE ALIGNMENT FOR CLUSTER ###############
+
+   if($num_genes > 100){
+      system("$muscle/muscle -in $out_dir{tmp_log}/$cluster_id/$cluster_id.fasta -maxiters 2 -out $out_dir{tmp_log}/$cluster_id/$cluster_id.afa -log $out_dir{tmp_log}/muscle.log -verbose -quiet");
+  
+   }else{
+     system("$muscle/muscle -in $out_dir{tmp_log}/$cluster_id/$cluster_id.fasta -out $out_dir{tmp_log}/$cluster_id/$cluster_id.afa -log $out_dir{tmp_log}/muscle.log -verbose -quiet");  
+   }
+
+   my $aln_objA=Bio::SeqIO->new(-file=>"$out_dir{tmp_log}/$cluster_id/$cluster_id.afa",
+                                 -format=> "fasta"
+                                );
+ 
+   my $aln_file="$out_dir{tmp_log}/$cluster_id/$cluster_id.afa";
+
+   ##### PAIR DISTANCE #######
+   my($distance_pair,$outgroup_pair,$alignment_type)=get_pair_distance($cluster_id,$aln_file,\%out_dir,$protdist); 
+
+   ##### MINIMUM DISTANCE PAIR ####
+
+   my($min_distance_pair,$distance,$paralog_pair)=minimum_distance_pair($distance_pair);
+
+   ##### RECIPROCAL ORTHOLOG DISTANCE PAIR ### 
+
+   my $ortholog_pair=ortholog_distance_pair($min_distance_pair,$outgroup_pair,$distance,\%out_dir,$cluster_id,$alignment_type);
+
+   ##### INPARALOG DISTANCE PAIR #############
+
+   my($inparalog_pair,$incongruent_pair)=inparalog_distance_pair($ortholog_pair,$paralog_pair,\%out_dir,$cluster_id,$alignment_type);
+
+   ##### Cluster Ortholog ####################
+
+  # my($ortholog_cluster)=cluster_ortholog($ortholog_pair,$inparalog_pair,$incongruent_pair,$alignment_type,$cluster_id);
+
+   ##### Print Ortholog Cluster ##############
+
+  # print_ortholog($ortholog_cluster,\%out_dir,$cluster_id);
+
+   remove_tree("$out_dir{tmp_log}/$cluster_id");
+  
+   return($cluster_id);
+}
+
+####### PRINT ORTHOLOG CLUSTER #####
+
+sub print_ortholog {
+
+   my(%ortholog_cluster)=%{(shift)};
+   my(%out_dir)=%{(shift)};
+   my($cluster_id)=(shift);
+
+   open(ORTHO_CLUSTER,">$out_dir{ortholog_cluster}/$cluster_id.txt");
+
+   foreach my $ortho_clust_id(keys %ortholog_cluster){
+
+           print ORTHO_CLUSTER "ortho".$cluster_id."."."$ortho_clust_id:\t";
+
+           my %ortholog_gene=%{$ortholog_cluster{$ortho_clust_id}};
+
+           foreach my $gene_id(keys %ortholog_gene){                 
+               print ORTHO_CLUSTER "$ortholog_gene{$gene_id}\t";
+           }
+       print ORTHO_CLUSTER "\n";   
+   }
+}
+
+####### CLUSTER ORTHOLOG PAIR ######
+
+sub cluster_ortholog {
+
+    my(%ortholog_pair)=%{(shift)};
+    my(%inparalog_pair)=%{(shift)};
+    my(%incongruent_pair)=%{(shift)};
+    my(%alignment_type)=%{(shift)};
+    my($cluster_id)=(shift);
+    my %ortholog_cluster=();
+   
+    my $clust_num=0;
+
+    #### cluster ortholog pairs ####
+    NEW_CLUSTER:
+    $clust_num++; 
+ 
+    my %orthogroup_gene=();  
+
+    CLUSTER_ORTHOLOG:     
+
+    foreach my $geneA(keys %ortholog_pair){
+
+         my %ortho_geneA=%{$ortholog_pair{$geneA}}; 
+         my %inpara_geneA=();
+
+         if(defined($inparalog_pair{$geneA})){
+           %inpara_geneA=%{$inparalog_pair{$geneA}};
+         }
+
+         my $havelink=1; 
+         my $cluster_size=keys %orthogroup_gene; 
+
+         if($cluster_size eq 0){
+
+            $orthogroup_gene{$geneA}=$clust_num;
+            $ortholog_cluster{$clust_num}->{$geneA}=$geneA;                            
+      
+            foreach my $geneB(keys %ortho_geneA){  
+               if((defined($alignment_type{$geneA}->{$geneB})) and (($alignment_type{$geneA}->{$geneB} eq "global") or ($alignment_type{$geneA}->{$geneB} eq "partial"))){            
+                  $orthogroup_gene{$geneB}=$clust_num;
+                  $ortholog_cluster{$clust_num}->{$geneB}=$geneB;
+               } 
+            }
+           
+            if(%inpara_geneA){
+               foreach my $inpara_geneB(keys %inpara_geneA){
+                 if((defined($alignment_type{$geneA}->{$inpara_geneB})) and (($alignment_type{$geneA}->{$inpara_geneB} eq "global") or ($alignment_type{$geneA}->{$inpara_geneB} eq "partial"))){ 
+                    $orthogroup_gene{$inpara_geneB}=$clust_num;
+                    $ortholog_cluster{$clust_num}->{$inpara_geneB}=$inpara_geneB;
+                 } 
+               }
+            }
+            delete($ortholog_pair{$geneA});
+            goto CLUSTER_ORTHOLOG;
+         }else{
+             if(!defined($orthogroup_gene{$geneA})){
+               $havelink=0;
+             }else{
+                 foreach my $geneB(keys %ortho_geneA){ 
+                  if((defined($alignment_type{$geneA}->{$geneB})) and (($alignment_type{$geneA}->{$geneB} eq "global") or ($alignment_type{$geneA}->{$geneB} eq "partial"))){
+                     if(!defined($orthogroup_gene{$geneB})){
+                         $havelink=0;
+                     }
+                   }
+                 }
+             }         
+         }
+
+         if($havelink eq 1){
+            $orthogroup_gene{$geneA}=$clust_num;
+            $ortholog_cluster{$clust_num}->{$geneA}=$geneA;
+
+            foreach my $geneB(keys %ortho_geneA){ 
+              if((defined($alignment_type{$geneA}->{$geneB})) and (($alignment_type{$geneA}->{$geneB} eq "global") or ($alignment_type{$geneA}->{$geneB} eq "partial"))){             
+                 $orthogroup_gene{$geneB}=$clust_num;
+                 $ortholog_cluster{$clust_num}->{$geneB}=$geneB;
+              } 
+            }
+            if(%inpara_geneA){
+              foreach my $inpara_geneB(keys %inpara_geneA){
+                if((defined($alignment_type{$geneA}->{$inpara_geneB})) and (($alignment_type{$geneA}->{$inpara_geneB} eq "global") or ($alignment_type{$geneA}->{$inpara_geneB} eq "partial"))){
+                   $orthogroup_gene{$inpara_geneB}=$clust_num;
+                   $ortholog_cluster{$clust_num}->{$inpara_geneB}=$inpara_geneB; 
+                }
+              }
+            }
+            delete($ortholog_pair{$geneA});
+            goto CLUSTER_ORTHOLOG; 
+         }                
+    }  
+
+    my $size_ortholog_pair=keys %ortholog_pair;
+
+    if($size_ortholog_pair ne 0){
+
+       goto NEW_CLUSTER;
+    }   
+    return(\%ortholog_cluster);
+}
+
+
+####### PAIR DISTANCE ###########
+
+sub get_pair_distance {
+
+    my($cluster_id)=(shift);
+    my($aln_file)=(shift); 
+    my(%out_dir)=%{(shift)};
+    my($protdist)=(shift);
+
+    chomp($protdist);   
+    
+    my %geneA=();
+    my %distance_pair=();
+    my %outgroup_pair=();
+    my %alignment_type=();
+
+    open(PAIR_DISTANCE,">$out_dir{pair_distance}/Distance_$cluster_id");
+
+    my $aln_objA=Bio::SeqIO->new(-file=>$aln_file,
+                                 -format=> "fasta"
+                                );
+
+    while(my $aln_seqA=$aln_objA->next_seq()){
+  
+          my $seq_idA=$aln_seqA->id;
+          $seq_idA=~s/\/(.*)//g;
+
+          my $seqA=$aln_seqA->seq();
+
+          $geneA{$seq_idA}=$seq_idA;
+        
+          my $aln_objB=Bio::SeqIO->new(-file=>$aln_file,
+                                       -format=> "fasta"
+                                      );
+           
+          while(my $aln_seqB=$aln_objB->next_seq()){
+
+              my $seq_idB=$aln_seqB->id;
+              $seq_idB=~s/\/(.*)//g;
+              
+              my $seqB=$aln_seqB->seq();
+
+              if(defined($geneA{$seq_idB})){
+                next; 
+              }
+      
+              ###### PAIRWISE DELETION ######
+
+              my %aligned_seq=();
+              my @positionseqA=split('',$seqA);
+              my @positionseqB=split('',$seqB);
+          
+              $aligned_seq{$seq_idA}=\@positionseqA;
+              $aligned_seq{$seq_idB}=\@positionseqB;
+              
+              my $corrected_alignment=pairwise_deletion(\%aligned_seq,$seq_idA,$seq_idB);
+
+              ###### MAKE PHYLIP FORMAT ALIGNMENT FILE ####             
+
+              my %corrected_alignment=%{$corrected_alignment};
+
+              my $length_alignment=length($corrected_alignment{$seq_idA});
+
+              if($length_alignment eq 0){
+                 next;
+              }else{
+
+                my $seqA_nogap=$seqA;
+                my $seqB_nogap=$seqB;
+
+                $seqA_nogap=~s/\-//g;
+                $seqB_nogap=~s/\-//g;
+     
+                my $seqA_align_region=sprintf "%.2f",(($length_alignment/length($seqA_nogap))*100);
+                my $seqB_align_region=sprintf "%.2f",(($length_alignment/length($seqB_nogap))*100);
+
+                if($seqA_align_region>=70 and $seqB_align_region>=70){
+                   $alignment_type{$seq_idA}->{$seq_idB}="global";
+                   $alignment_type{$seq_idB}->{$seq_idA}="global";
+                   #print "$seq_idA\t$seq_idB\t$alignment_type{$seq_idA}->{$seq_idB}\t$seqA_align_region\t$seqB_align_region\n";
+                }elsif(($seqA_align_region>=70 and ($seqB_align_region>=50 and $seqB_align_region<70)) or (($seqA_align_region>=50 and $seqA_align_region<70) and $seqB_align_region>=70)){
+                   $alignment_type{$seq_idA}->{$seq_idB}="partial";
+                   $alignment_type{$seq_idB}->{$seq_idA}="partial";
+                   #print "$seq_idA\t$seq_idB\t$alignment_type{$seq_idA}->{$seq_idB}\t$seqA_align_region\t$seqB_align_region\n";
+                }elsif($seqA_align_region<50 or $seqB_align_region<50){
+                   $alignment_type{$seq_idA}->{$seq_idB}="overlap";
+                   $alignment_type{$seq_idB}->{$seq_idA}="overlap";
+                   #print "$seq_idA\t$seq_idB\t$alignment_type{$seq_idA}->{$seq_idB}\t$seqA_align_region\t$seqB_align_region\n";
+                }
+              }
+              
+              open(PHY_ALN,">$out_dir{tmp_log}/$cluster_id/pair_alignment.phy");
+              print PHY_ALN "2 $length_alignment\n";
+              print PHY_ALN "SEQ_0001  $corrected_alignment{$seq_idA}\n";
+              print PHY_ALN "SEQ_0002  $corrected_alignment{$seq_idB}\n";
+              close PHY_ALN;
+
+              ###### PAIRWISE DISTANCE ######## 
+              open(PARAMS,">$out_dir{tmp_log}/$cluster_id/param");
+              print PARAMS "pair_alignment.phy\n";
+              print PARAMS "Y";
+              close PARAMS;
+
+              chdir("$out_dir{tmp_log}/$cluster_id"); 
+              system("$Bin/$protdist/protdist < $Bin/$out_dir{tmp_log}/$cluster_id/param > $Bin/$out_dir{tmp_log}/$cluster_id/protdist.log");
+
+              my $dist = Bio::Tools::Phylo::Phylip::ProtDist->new(-file=> "outfile",                  
+	                                                          -format=> 'phylip',
+                                                                  -program=>"ProtDist"); 
+              my $matrix=$dist->next_matrix;
+
+              my $distance_value = $matrix->get_entry("SEQ_0001","SEQ_0002");
+               
+              print PAIR_DISTANCE "$seq_idA\t$seq_idB\t$distance_value\n";
+
+              if($distance_value<=0.5){ 
+                           
+                $distance_pair{$seq_idA}->{$seq_idB}=$distance_value;
+                $distance_pair{$seq_idB}->{$seq_idA}=$distance_value;               
+              }else{
+
+                $outgroup_pair{$seq_idA}->{$seq_idB}=$distance_value;
+                $outgroup_pair{$seq_idB}->{$seq_idA}=$distance_value;
+              }
+
+              unlink("outfile");
+
+              chdir($Bin);                                    
+         }
+   }                                    
+   close PAIR_DISTANCE;             
+ return(\%distance_pair,\%outgroup_pair,\%alignment_type); 
+}
+
+####### PAIRWISE DELETION ############
+
+sub pairwise_deletion {
+
+    my(%aligned_seq)=%{(shift)};
+    my($seq_idA)=(shift);
+    my($seq_idB)=(shift);
+
+    my %corrected_alignment=();
+
+    my @positionseqA=@{$aligned_seq{$seq_idA}};
+    my @positionseqB=@{$aligned_seq{$seq_idB}};
+
+    my $alignment_length=scalar(@positionseqA);
+
+    for(my $i=0;$i<$alignment_length;$i++){
+        if($positionseqA[$i] eq "-" or $positionseqB[$i] eq "-"){
+           $positionseqA[$i]="*";
+           $positionseqB[$i]="*";
+        }
+    }
+    my $seqA=join('',@positionseqA);
+    my $seqB=join('',@positionseqB);
+
+    $seqA=~s/\*//g;
+    $seqB=~s/\*//g;
+
+    $corrected_alignment{$seq_idA}=$seqA;
+    $corrected_alignment{$seq_idB}=$seqB;
+
+    return(\%corrected_alignment);    
+}
+
+######## MINIMUM DISTANCE PAIR ##############
+
+sub minimum_distance_pair {
+
+    my(%distance_pair)=%{(shift)};
+
+    my %distance=();
+    my %min_distance_pair=();
+    my %paralog_pair=();
+
+    
+     foreach my $geneA_id(keys %distance_pair){
+
+          my %pair_gene=%{$distance_pair{$geneA_id}};
+
+          $geneA_id=~/(\w+)(\|)(.+)/;
+
+          my $taxaA=$1;
+
+          foreach my $geneB_id(keys %pair_gene){
+
+               $geneB_id=~/(\w+)(\|)(.+)/;
+
+               my $taxaB=$1;             
+
+               my $distance_value=$pair_gene{$geneB_id};
+
+               if($taxaA eq $taxaB){
+                 $paralog_pair{$geneA_id}->{$geneB_id}=$distance_value;
+                 $paralog_pair{$geneB_id}->{$geneA_id}=$distance_value;
+                 next;
+               }
+
+               if(defined($distance{$geneA_id}->{$taxaB})){
+
+                 if($distance_value eq $distance{$geneA_id}->{$taxaB}){
+
+                    $distance{$geneA_id}->{$taxaB}=$distance_value;
+
+                    my @min_dist_pair_gene=@{$min_distance_pair{$geneA_id}->{$taxaB}};
+
+                    push(@min_dist_pair_gene,$geneB_id);
+
+                    $min_distance_pair{$geneA_id}->{$taxaB}=\@min_dist_pair_gene;
+
+                 }elsif($distance_value < $distance{$geneA_id}->{$taxaB}){
+
+                    $distance{$geneA_id}->{$taxaB}=$distance_value;
+
+                    my @min_dist_pair_gene=();
+
+                    push(@min_dist_pair_gene,$geneB_id);
+
+                    $min_distance_pair{$geneA_id}->{$taxaB}=\@min_dist_pair_gene;
+                 }
+               }else{
+                    $distance{$geneA_id}->{$taxaB}=$distance_value;
+
+                    my @min_dist_pair_gene=();
+
+                    push(@min_dist_pair_gene,$geneB_id);
+
+                    $min_distance_pair{$geneA_id}->{$taxaB}=\@min_dist_pair_gene;
+               } 
+          }      
+     }        
+   
+  return(\%min_distance_pair,\%distance,\%paralog_pair);
+}
+
+######## ORTHOLOG PAIR #######
+
+sub ortholog_distance_pair {
+
+    my(%min_distance_pair)=%{(shift)};
+    my(%outgroup_pair)=%{(shift)};
+    my(%distance)=%{(shift)};
+    my(%out_dir)=%{(shift)};
+    my($cluster_id)=(shift);
+    my(%alignment_type)=%{(shift)};
+
+    my %ortholog_pair=();
+
+    open(ORTHO_DIST,">$out_dir{pair_ortholog}/ortho_pair_$cluster_id.txt");
+    
+    foreach my $geneA_id(keys %min_distance_pair){
+
+         my %pair_taxa=%{$min_distance_pair{$geneA_id}};
+
+         $ortholog_pair{$geneA_id}->{$geneA_id}=0.00001;
+
+         foreach my $taxaB(keys %pair_taxa){
+
+              my @list_min_dist_gene=@{$pair_taxa{$taxaB}};
+
+              foreach my $geneB_id(@list_min_dist_gene){
+                 $ortholog_pair{$geneA_id}->{$geneB_id}=$distance{$geneA_id}->{$taxaB};
+              }  
+         }      
+    }
+
+   ##### Remove non-reciprocal pairs from the hash ####
+    foreach my $geneA_id(keys %ortholog_pair){
+
+          my %pair_gene=%{$ortholog_pair{$geneA_id}};
+
+          foreach my $geneB_id(keys %pair_gene){
+
+               if(!defined($ortholog_pair{$geneB_id}->{$geneA_id})){
+
+                   delete($ortholog_pair{$geneA_id}->{$geneB_id});
+
+               }elsif($ortholog_pair{$geneA_id}->{$geneB_id}>0.7){
+
+                   delete($ortholog_pair{$geneA_id}->{$geneB_id});
+                   delete($ortholog_pair{$geneB_id}->{$geneA_id});
+               }else{
+                    ####### Verify ortholog pairs by method used in ortholuge algorithm (Fulton et al.2006) #####
+        
+                   # my($outgroup_distanceA,$outgroup_distanceB)=findoutgroupforpair($geneA_id,$geneB_id,\%outgroup_pair);
+
+                   # if($outgroup_distanceA eq ''){
+                   #    $outgroup_distanceA=1;
+                   # }
+                   # if($outgroup_distanceB eq ''){
+                   #    $outgroup_distanceB=1;
+                   # }
+
+                   # my $ratio_distanceA=($ortholog_pair{$geneA_id}->{$geneB_id})/($outgroup_distanceA);
+                   # my $ratio_distanceB=($ortholog_pair{$geneA_id}->{$geneB_id})/($outgroup_distanceB);
+                   
+                   # if($ratio_distanceA>0.6 and $ratio_distanceB>0.6){
+                   #    delete($ortholog_pair{$geneA_id}->{$geneB_id});
+                   #    delete($ortholog_pair{$geneB_id}->{$geneA_id});
+                   # }
+                    if(defined($alignment_type{$geneA_id}->{$geneB_id}) and ($alignment_type{$geneA_id}->{$geneB_id} eq "overlap")){                    
+                       delete($ortholog_pair{$geneA_id}->{$geneB_id});
+                       delete($ortholog_pair{$geneB_id}->{$geneA_id});
+                    }else{
+                        print ORTHO_DIST "$geneA_id\t$geneB_id\t$ortholog_pair{$geneA_id}->{$geneB_id}\n";
+                    }
+                }
+          }
+    }
+    close ORTHO_DIST;        
+     
+ return(\%ortholog_pair);    
+}
+
+######## OutGroup Gene ##############
+
+sub findoutgroupforpair {
+
+    my($geneA_id)=(shift);
+    my($geneB_id)=(shift);
+    my(%outgroup_pair)=%{(shift)};
+
+    my $outgroup_distanceA=0.0;
+    my $outgroup_distanceB=0.0;
+
+    my %outgroup_geneA=();
+    my %outgroup_geneB=();
+
+    if(defined($outgroup_pair{$geneA_id}) and defined($outgroup_pair{$geneB_id})){
+        %outgroup_geneA=%{$outgroup_pair{$geneA_id}};
+        %outgroup_geneB=%{$outgroup_pair{$geneB_id}};
+    }
+
+    foreach my $outgroup(keys %outgroup_geneA){
+         if(defined($outgroup_geneB{$outgroup})){
+            $outgroup_distanceA=$outgroup_geneA{$outgroup};
+            $outgroup_distanceB=$outgroup_geneB{$outgroup};
+            last;
+         }
+    }
+    return($outgroup_distanceA,$outgroup_distanceB);
+}
+
+######### INPARALOG PAIR ############
+
+sub inparalog_distance_pair {
+
+    my(%ortholog_pair)=%{(shift)};
+    my(%paralog_pair)=%{(shift)};
+    my(%out_dir)=%{(shift)};
+    my($cluster_id)=(shift);
+    my(%alignment_type)=%{(shift)};
+
+    my %inparalog_pair=();
+    my %min_max_distance=();
+    my %incongruent_pair=();
+
+
+    ###### get minimum and maximum distance with orthologs for each gene #####
+
+     foreach my $geneA_id(keys %ortholog_pair){
+
+           my %distance=%{$ortholog_pair{$geneA_id}};
+          
+           #### maximum distance #### 
+           foreach my $geneB_id(sort {$distance{$b} <=> $distance{$a}} keys %distance){
+                   
+              if($geneA_id eq $geneB_id) {next;}
+
+              $min_max_distance{$geneA_id}->{maximum}=$distance{$geneB_id};
+             
+              last; 
+           }
+
+           #### Minimum distance ####
+           foreach my $geneB_id(sort {$distance{$a} <=> $distance{$b}} keys %distance){
+ 
+              if($geneA_id eq $geneB_id) {next;}
+
+              $min_max_distance{$geneA_id}->{minimum}=$distance{$geneB_id}; 
+            
+              last; 
+           }           
+     }
+
+    ###### Filter Inparalog and Incongruent Pairs ###############
+
+   open(INPARALOG_DIST,">$out_dir{pair_inparalog}/inpara_pair_$cluster_id.txt");
+
+   open(INCONGRUENT_DIST,">$out_dir{pair_incongruent}/incongruent_pair_$cluster_id.txt");
+
+     foreach my $geneA_id(keys %paralog_pair){
+
+          my %pair_gene=%{$paralog_pair{$geneA_id}};
+
+          $geneA_id=~/(\w+)(\|)(.+)/;
+
+          my $taxaA=$1;
+
+          foreach my $geneB_id(keys %pair_gene){
+
+               $geneB_id=~/(\w+)(\|)(.+)/;
+
+               my $distance_value=$pair_gene{$geneB_id};
+
+               if((defined($min_max_distance{$geneA_id}->{minimum})) and ($distance_value<=$min_max_distance{$geneA_id}->{minimum})){
+                 if(defined($alignment_type{$geneA_id}->{$geneB_id}) and ($alignment_type{$geneA_id}->{$geneB_id} ne "overlap")){
+                   $inparalog_pair{$geneA_id}->{$geneB_id}=$distance_value;
+                   $inparalog_pair{$geneB_id}->{$geneA_id}=$distance_value;                      print INPARALOG_DIST "$geneA_id\t$geneB_id\t$inparalog_pair{$geneA_id}->{$geneB_id}\t$min_max_distance{$geneA_id}->{minimum}\n";                                
+                 }
+               }elsif((defined($min_max_distance{$geneA_id}->{minimum})) and (defined($min_max_distance{$geneA_id}->{maximum})) and ($distance_value>$min_max_distance{$geneA_id}->{minimum} and $distance_value<=$min_max_distance{$geneA_id}->{maximum})){
+                 if(defined($alignment_type{$geneA_id}->{$geneB_id}) and ($alignment_type{$geneA_id}->{$geneB_id} ne "overlap")){
+
+                   $incongruent_pair{$geneA_id}->{$geneB_id}=$distance_value;
+                   $incongruent_pair{$geneB_id}->{$geneA_id}=$distance_value; 
+                 
+                   print INCONGRUENT_DIST "$geneA_id\t$geneB_id\t$incongruent_pair{$geneA_id}->{$geneB_id}\t$min_max_distance{$geneA_id}->{minimum}\t$min_max_distance{$geneA_id}->{maximum}\n";            
+                 }
+                }             
+         }
+
+     } 
+
+     close INPARALOG_DIST;
+     close INCONGRUENT_DIST;    
+    
+    return(\%inparalog_pair,\%incongruent_pair);   
+}

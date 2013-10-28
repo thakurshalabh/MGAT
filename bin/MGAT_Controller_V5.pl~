@@ -1,0 +1,738 @@
+#!/usr/bin/perl -w
+###### ABOUT: This Script is the main controller for the execution of MGAT Package ############
+###### AUTHOR:Shalabh Thakur###################################################################
+###### DATE:15-MAY-2013########################################################################
+
+use strict;
+use Env;
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use Configuration;
+use AdjustSequence;
+use SequenceHash;
+use Hmmer;
+use CompareReference;
+use FilterPair;
+use SelectModelGene;
+use CreateModel;
+use Getopt::Long;
+use List::MoreUtils qw(uniq);
+use List::Util qw(sum);
+use File::Basename;
+use File::Copy;
+use File::Path qw(remove_tree);
+use Parallel::ForkManager;
+use Hash::Merge qw( merge );
+
+
+##### DECLARE INPUT VARIABLE #####
+
+my $configuration_file=undef;
+my $project_name=undef;
+my $help=undef;
+
+##### SET ENVIRONMENTAL VARIABLE #####
+
+$ENV{$HOME}=$Bin;
+
+##### DEFINE DIRECTORIES #####
+
+my $bin=$Bin;
+my $config="../config";
+my $data="../data";
+my $inseq_dir="../sequence";
+my $output="../output";
+my $tmp="/tmp";            ### System folder ###
+my $log="../log";
+my $exe="../exe";
+
+
+##### APPLICATION #####
+
+my $mcl="$exe/mcl/bin";
+my $muscle="$exe/muscle";
+my $protdist="$exe/protdist";
+my $hmmer="$exe/hmmer";
+
+##### DECLARE GLOBAL VARIABLE #####
+
+my %config_param=();
+my %query_genome=();
+my %reference_genome=();
+my %out_dir=();
+my %seq_id_table=();
+my %seq_len_table=();
+my %sequence=();
+my %group_gene=();
+my %pair_distance=();
+my %homologue_group=();
+my %average_dist_group=();
+my %total_dist_group=();
+my %count_pair_group=();
+my %model_gene=();
+my %aligned=();
+my @query_file=();
+my @reference_file=();
+my $cluster_num=1;
+my $cluster_file='';
+my $hmm_program='';
+my $group_for_query={};
+
+##### READ COMMAND LINE INPUT VARIABLES #####
+
+GetOptions('config=s'  =>  \$configuration_file,
+           'project=s' =>  \$project_name,
+           'help=s'    =>  \$help
+          );
+
+##### SHOW HELP #####
+if(defined($help)){
+   showHelp();
+   exit;
+}
+
+sub showHelp {
+
+   print STDOUT "Program: Microbial Genome analysis Toolkit\n",
+                "Author:  Shalabh Thakur\n",
+                "Version: 1.0\n\n";
+
+   print STDOUT "[Mandatory Parameters]\n",
+                "-config: This parameters take MGAT configuration file name as input.",
+                "By Default configuration file would be searched in config folder of Home directory. ",
+                "If configuration file is locted in another directory, than change the url of config dir",
+                "in the script.\n\n";
+
+   print STDOUT "[Optional Parameters]\n",
+                "-project: Name of existing project directory\n",
+                "-help: Give information on available options\n";
+   
+}
+
+#### CALL MAIN ####
+main();
+
+
+#### MAIN Subroutin ######
+sub main {
+
+    unless(defined($configuration_file)){
+      print STDERR "Error: Configuration file name not found\n";
+    }
+
+    ##### Read Configuration File #####
+    print STDOUT "READ CONFIGURATION FILE\n";
+    $configuration_file="$config/$configuration_file"; 
+    %config_param=Configuration::getConfig($configuration_file);
+
+    ##### Create New Project #####
+
+    if(!defined($project_name)) {
+	my @timedata = localtime();
+	   $timedata[5] += 1900;
+	   $timedata[4] += 1;
+	   $project_name=$timedata[0].$timedata[1].$timedata[2].$timedata[3].$timedata[4].$timedata[5];
+	   $project_name="Project_".$project_name;	
+    } 
+
+    ##### Create Directory Structure #####
+
+    buildOutputDir($project_name,$config_param{ACTIVATE_ANALYSIS});   
+    
+    ##### Adjust Sequences by adding genome_name tag to each sequence ID (Genome_Name|Sequence_ID) #####
+
+    print STDOUT "ADJUST SEQUENCES IN QUERY DIRECTORY\n";
+
+    opendir(Qseq_dir,$config_param{SEQUENCE_DIRECTORY}->{QUERY_DIR}) or die "Cannot open directory\n";
+    @query_file=readdir(Qseq_dir);
+    my @tmp_query=@query_file;
+    %query_genome=map{$_=>$_}@tmp_query;
+
+    AdjustSequence::checkSequence($config_param{SEQUENCE_DIRECTORY}->{QUERY_DIR},
+                                  $config_param{SEQUENCE}->{SEQ_FORMAT},
+                                  $config_param{SEQUENCE}->{ADJUST_HEADER},
+                                  $inseq_dir,\@query_file);
+    
+
+    print STDOUT "ADJUST SEQUENCES IN REFERENCE DIRECTORY\n";
+
+    opendir(Rseq_dir,$config_param{SEQUENCE_DIRECTORY}->{REFERENCE_DIR}) or die "Cannot open directory\n";
+    @reference_file=readdir(Rseq_dir);
+    my @tmp_reference=@reference_file;
+    %reference_genome=map{$_=>$_}@tmp_reference;
+
+    AdjustSequence::checkSequence($config_param{SEQUENCE_DIRECTORY}->{REFERENCE_DIR},
+                                  $config_param{SEQUENCE}->{SEQ_FORMAT},
+                                  $config_param{SEQUENCE}->{ADJUST_HEADER},
+                                  $inseq_dir,\@reference_file);
+
+
+    ###### READ SEQUENCE FEATURES: SEQUENCE , SEQUENCE_ID, SEQEUNCE_LENGTH ######
+    my ($SequenceLenHashTable,$SequenceIDHashTable,$SequenceHash)=SequenceHash::getSequenceFeature($inseq_dir);
+
+    %seq_len_table=%{$SequenceLenHashTable};
+    %seq_id_table=%{$SequenceIDHashTable};
+    %sequence=%{$SequenceHash};
+
+    my $process=$config_param{PARALLEL_PROCESS}->{MAX_PROCESS};   #### Number of parallel Process #####
+####################################################################################################################################
+
+##### FOR REFERENCE GENOME, PREPARE TO SCAN REFERENCE GENOME, PREDICT REFERENCE CLUSTER ##########################
+
+    if($config_param{GROUP}->{INPUT_GROUP} eq "NO"){
+          my $similairty_file=CompareReference::compareReference(\%config_param,\%out_dir,\@reference_file,\%seq_len_table,\%seq_id_table,$inseq_dir,$hmmer); 
+          ##### MCL CLUSTERING ######
+          my $mcl_output=mclClustering($similairty_file);
+          ##### ADD GROUP ID ########
+         ($cluster_file,$group_for_query)=addGroupID($mcl_output,$cluster_num,$hmm_program,\%homologue_group);      
+          $config_param{GROUP}->{INPUT_GROUP}="YES";      
+    }
+
+#####################################################################################################################################
+
+###### FOR QUERY GENOME, PREPARE TO SCAN QUERY GENOME, PREDICT HOMOLOGUE CLUSTER ###########################################################################   
+###### IF REFERENCE GROUP CLUSTER IS given as INPUT or created in earlier iteration do this #################
+
+      if($config_param{GROUP}->{INPUT_GROUP} eq "YES"){
+
+             ### If cluster_file is not created in eariler steps, it should be given in the configuration file ####
+             if($cluster_file eq ''){
+                $cluster_file=$config_param{GROUP}->{GROUP_CLUSTER_FILE};
+             }         
+
+             my $jump_to_step=0; ### Begining of the process ###
+
+             ### Monitor process time for each step ####
+             open(LOG_TIME,">$out_dir{tmp_log}/execution_time.log");
+            
+             ###### If HMM model files and distance file available for the given cluster, initialize global variables ######
+ 
+             if($config_param{GROUP}->{GROUP_MODEL_DIR}){            
+              
+                 print "READ CLUSTER $cluster_file\n";           
+
+                 my($homologue_group,$query_status)=readCluster($cluster_file,'xxx'); 
+                 my($ref_group_gene,$ref_pair_distance)=initializeGlobalVariable($homologue_group);                          
+                 %group_gene=%{$ref_group_gene};
+                 %pair_distance=%{$ref_pair_distance};                                   
+                 $jump_to_step=4; 
+                 undef $homologue_group;               
+             }  
+
+          #### Start Iteration for query sequences ################################################
+          my $count_query=0;
+
+          foreach(@query_file){
+           
+            #### If file do not exist ###############
+              if($_=~/^\.+$/ or $_=~/\~/){             
+                 $count_query++;
+                 next;
+              }             
+              my $genome_name=$_;
+              $genome_name=~s/\.(\w+)//g;
+
+            ##### If query is a reference genome, Skip ####      
+              if($reference_genome{$_}){               
+                  $count_query++;
+                  next;
+              }             
+  
+            ##### Query File ####  
+              my $query_file=$inseq_dir."/".$_;                
+              undef %homologue_group;
+                          
+              print "Query: $query_file\n";          
+            
+             #### 1: Read cluster file #####            
+              print "READ CLUSTER $cluster_file\n";           
+              my($homologue_group,$query_status)=readCluster($cluster_file,$genome_name);
+
+             ### If any sequence from query file is already present in cluster, do not process that query further #####
+                if($query_status==1){ 
+                   print "Warning: Cluster file contains sequences from $genome_name, skip this genome\n";
+                   $count_query++;
+                   next;
+                }             
+
+             %homologue_group=%{$homologue_group};           #### holds cluster information ####               
+
+             #### Jump to this step if alignment, hmm models and distance file provided #####
+             if($jump_to_step==4){
+                 $jump_to_step=0;
+                 goto(BUILD_DB);                
+             }                    
+      
+             COME_HERE_AT_THE_END:
+  
+             #### count number of clusters #####
+             my $count_groups=keys(%{$homologue_group});        
+             print "Number of groups: $count_groups\n";
+               
+             #### Select Genes for Models #####
+             print "Selecting Genes for HMM Model\n";
+             my $start_model_selection = time;
+             my($ref_model_gene,$ref_group_gene,$ref_pair_distance)=SelectModelGene::findGeneForHMMModel(\%sequence,$homologue_group,$group_for_query,\%group_gene,\%pair_distance,\%out_dir,$muscle,$protdist,$process,$tmp);
+             my $end_model_selection = time;
+             my $run_time1=$end_model_selection-$start_model_selection;
+             print LOG_TIME "$cluster_file\t$count_groups\tmodel_selection\t",int($run_time1/ 3600),"h:",int(($run_time1 % 3600) / 60),"m:",int($run_time1 % 60),"s\n";
+
+             
+             #### 3: Start Building HMM Models for Gene family #####
+             #### Output the list of gene used in model and groups from which alignment was built ##### 
+                       
+             print "Buidling HMM Model\n";
+             my $start_model_build = time;    
+             CreateModel::createHMMModel($ref_model_gene,\%out_dir,$muscle,$hmmer,$process); 
+             my $end_model_build = time;
+             my $run_time2=$end_model_build-$start_model_build;
+             print LOG_TIME "$cluster_file\t$count_groups\tmodel_build\t",int($run_time2/ 3600),"h:",int(($run_time2 % 3600) / 60),"m:",int($run_time2 % 60),"s\n";
+
+             
+             ##### 6: Print Out Group total distance, average distance and pairs in group #####
+
+             #printGroupDistance($ref_total_dist,$ref_count_pair,$ref_average_dist);
+             printPairDistance($ref_pair_distance,$out_dir{distance_file});
+             
+             if($count_query eq scalar(@query_file)){
+                last;
+             }
+
+             ##### Dereference Global Variables ########
+             undef %group_gene;
+             undef %pair_distance;         
+            
+             %group_gene=%{$ref_group_gene};                                 
+             %pair_distance=%{$ref_pair_distance};
+                         
+             BUILD_DB:   ##### Come here if $jump_step==4 ##### 
+
+             print "BUILD HMM MODEL DATABASE\n";
+
+             open(MODEL_DB,">$out_dir{hmm_db_dir}/$config_param{DATABASE}->{MODEL_DB}");
+             close(MODEL_DB);
+
+             if(-e "$out_dir{hmm_db_dir}/$config_param{DATABASE}->{MODEL_DB}.h3i"){
+
+                   unlink("$out_dir{hmm_db_dir}/$config_param{DATABASE}->{MODEL_DB}.h3i");
+                   unlink("$out_dir{hmm_db_dir}/$config_param{DATABASE}->{MODEL_DB}.h3f");
+                   unlink("$out_dir{hmm_db_dir}/$config_param{DATABASE}->{MODEL_DB}.h3m");
+                   unlink("$out_dir{hmm_db_dir}/$config_param{DATABASE}->{MODEL_DB}.h3p");
+              }
+
+             chdir("$out_dir{hmm_file_dir}");
+             system("ls | xargs cat > $bin/$out_dir{hmm_db_dir}/$config_param{DATABASE}->{MODEL_DB}");
+             chdir($bin);
+
+             system("$hmmer/hmmpress $out_dir{hmm_db_dir}/$config_param{DATABASE}->{MODEL_DB}");  
+
+             print "BUILD HMM SINGLETON DATABASE\n";
+
+             open(SINGLETON_DB,">$out_dir{hmm_db_dir}/$config_param{DATABASE}->{SEQUENCE_DB}");
+             close SINGLETON_DB;
+             
+             chdir("$out_dir{singleton_group}");             
+             system("ls | xargs cat > $bin/$out_dir{hmm_db_dir}/$config_param{DATABASE}->{SEQUENCE_DB}");
+             chdir($bin);
+
+              ##### 5: Scan Models against Query #####
+
+              my $start_hmmsearch = time;
+              my $program=$hmmer."/"."hmmscan";             
+
+              print "Run HMMScan for $query_file\n";                               
+           
+             Hmmer::Run($program,$query_file,$out_dir{hmm_db_dir}."/".$config_param{DATABASE}->{MODEL_DB},
+                        $out_dir{tmp_log},
+                        $out_dir{tmp_log},
+                        $out_dir{tmp_log},
+                        $config_param{HMMER});                   
+                    
+             print "....done\n";
+
+              ##### Complie hmm search results #### 
+              print "Compiling HMM Search Output\n";           
+              system("cat $out_dir{tmp_log}/dom_$genome_name.out > $out_dir{hmm_domout_dir}/dom_$genome_name.out");
+              system("cat $out_dir{tmp_log}/full_$genome_name.out > $out_dir{hmm_fullout_dir}/full_$genome_name.out");
+              unlink("$out_dir{tmp_log}/dom_$genome_name.out");
+              unlink("$out_dir{tmp_log}/full_$genome_name.out");
+
+              my $end_hmmsearch = time;
+              my $run_time3=$end_hmmsearch-$start_hmmsearch;
+              print LOG_TIME "$cluster_file\thmmscan\t",int($run_time3/ 3600),"h:",int(($run_time3 % 3600) / 60),"m:",int($run_time3 % 60),"s\n";                  
+             
+              
+              ###### Scan Singleton Groups #######             
+              print "Run Phmmer for Singlton groups\n";
+              my $start_singleton = time; 
+              $program=$hmmer."/"."phmmer";     
+                               
+              Hmmer::Run($program,$query_file,$out_dir{hmm_db_dir}."/".$config_param{DATABASE}->{SEQUENCE_DB},
+                         $out_dir{tmp_log},
+                         $out_dir{tmp_log},
+                         $out_dir{tmp_log},
+                         $config_param{HMMER});                             
+                     
+
+              print "....done\n";
+
+              ##### Compile hmm singleton results ####
+              print "Compiling PHMMER Search Output\n";
+
+              #### Shuffle columns ####
+              open(TMP_DOM,"$out_dir{tmp_log}/dom_$genome_name.out");
+              my @tmp_dom=<TMP_DOM>;
+              close TMP_DOM;
+
+              open(TMP_DOM,">$out_dir{tmp_log}/dom_$genome_name.out");   
+
+              foreach(@tmp_dom){
+               
+                 if($_=~/\#/) {next;}
+
+                 my @column=split(' ',$_);
+
+                 my $temp=$column[15];
+                 $column[15]=$column[17];
+                 $column[17]=$temp;
+
+                 $temp=$column[16];
+                 $column[16]=$column[18];
+                 $column[18]=$temp;
+                 foreach my $value(@column){
+                   chomp($value);
+                   print TMP_DOM "$value\t";
+                 }
+                 print TMP_DOM "\n";              
+              }
+              close TMP_DOM;
+ 
+              system("cat $out_dir{tmp_log}/dom_$genome_name.out >> $out_dir{hmm_domout_dir}/dom_$genome_name.out");
+              system("cat $out_dir{tmp_log}/full_$genome_name.out >> $out_dir{hmm_fullout_dir}/full_$genome_name.out");
+              unlink("$out_dir{tmp_log}/dom_$genome_name.out");
+              unlink("$out_dir{tmp_log}/full_$genome_name.out");
+
+              my $end_singleton = time;
+              my $run_time4=$end_singleton-$start_singleton;
+              print LOG_TIME "$cluster_file\tphmmer\t",int($run_time4/ 3600),"h:",int(($run_time4 % 3600) / 60),"m:",int($run_time4 % 60),"s\n";
+                  
+              
+              ###### Parse HMM Search Result ################
+             # BUILD_DB: 
+              my $similarity_file="SimilarityPair.txt";
+              $hmm_program="hmmscan"; 
+              $group_for_query={};                    
+
+              print STDOUT "Parsing $query_file scan result\n";
+              Hmmer::Sort_table($query_file,$out_dir{hmm_domout_dir});
+              my($read_hmmscan_output,$hit_feature)=Hmmer::Read_domain_table($hmm_program,$query_file,$out_dir{hmm_domout_dir});
+              my($sequence_alignment)=Hmmer::Read_aligned_sequence($hmm_program,$query_file,$out_dir{hmm_fullout_dir},$hit_feature);    
+              FilterPair::getHitForQuery($hmm_program,$genome_name,$config_param{REFERENCE},$config_param{PARSE_HMMER},$config_param{HMMER},$out_dir{similarity_dir},$out_dir{all_similarity_dir},$read_hmmscan_output,$sequence_alignment,$seq_id_table{$genome_name},$seq_len_table{$genome_name});       
+              system("cat $out_dir{similarity_dir}/besthit_$genome_name.txt > $out_dir{mcl_dir}/$similarity_file");
+
+              ##### MCL CLUSTERING ######
+              my $mcl_output=mclClustering($similarity_file);
+              $cluster_num++;   ##### Next Cluster File counter ### 
+
+              ##### Assign genes to GROUP #####             
+
+              ($cluster_file,$group_for_query)=addGroupID($mcl_output,$cluster_num,$hmm_program,\%homologue_group);                
+               $count_query++;             
+
+              ######### BUILD HMM MODEL and ALIGNMENT for final Cluster ##############
+              if($count_query eq scalar(@query_file)){                 
+                 print "Computing Cluster and Distance for analysis\n";
+                 system("cp $out_dir{cluster_dir}/Cluster_$cluster_num.txt $out_dir{homolog_dir}/groups.txt");     
+                 goto COME_HERE_AT_THE_END;
+              }             
+         }         
+                                                        
+    }                   
+}
+
+##### END OF MAIN ################################################################################################
+
+##### SUBROUTINS #################################################################################################
+
+#### Subroutin to initialize global variable #####
+
+sub initializeGlobalVariable {
+
+    my(%homologue_group)=%{(shift)};
+
+    my %group_gene=(); 
+    my %pair_distance=();
+
+    ##### Init %group_gene, %aligned_gene, %model_gene and %aligned_group #####
+
+    print "INITIALIZE GLOBAL VARIABLES.....\n";
+
+     foreach my $group_id(keys %homologue_group){            
+
+            my $gene_list=$homologue_group{$group_id};
+            my @gene_list=split("\t",$gene_list);
+            
+            foreach(@gene_list){
+                $group_gene{$_}=$_;               
+            }          
+            unless(-e "$config_param{GROUP}->{GROUP_MODEL_DIR}/$group_id.hmm" or -e "$config_param{GROUP}->{GROUP_SINGLETON_DIR}/$group_id.fasta"){
+                 print "Cannot open file $group_id in HMM directory\n";
+                 exit;
+            }else{
+                 if(-e "$config_param{GROUP}->{GROUP_MODEL_DIR}/$group_id.hmm"){                   
+                  #  system("cp $config_param{GROUP}->{GROUP_MODEL_DIR}/$group_id.hmm $out_dir{hmm_file_dir}/$group_id.hmm");                 
+                 }elsif(-e "$config_param{GROUP}->{GROUP_SINGLETON_DIR}/$group_id.fasta"){
+                  #  system("cp $config_param{GROUP}->{GROUP_SINGLETON_DIR}/$group_id.fasta $out_dir{singleton_group}/$group_id.fasta");
+                 }
+            }           
+    } 
+ 
+    if(-e "$config_param{GROUP}->{GROUP_DISTANCE_FILE}"){
+         
+         print "READING PAIRWISE DISTANCES\n";
+         open(PAIR_DISTANCE,"$config_param{GROUP}->{GROUP_DISTANCE_FILE}");
+         
+         foreach(<PAIR_DISTANCE>){
+             my @pair=split(' ',$_); 
+             chomp($pair[3]);          
+             $pair_distance{$pair[0]}->{$pair[1]}->{$pair[2]}=$pair[3];
+         }
+    }
+    return(\%group_gene,\%pair_distance);
+}
+
+
+##### Subroutin to printout the total genetic distance and pair for each group #####
+##### format out output file: group_id	total_pairs total_distance average_distance #####
+
+#sub printGroupDistance {
+#
+#    my(%total_dist_group)=%{(shift)};
+#    my(%count_pair_group)=%{(shift)};
+#    my(%average_dist_group)=%{(shift)};
+#
+#    open(DISTANCE,">$out_dir{distance_file}/GroupDistance.txt");
+#
+#    foreach my $group_id(keys %total_dist_group){
+#
+#         print DISTANCE "$group_id\t$count_pair_group{$group_id}\t$total_dist_group{$group_id}\t$average_dist_group{$group_id}\n";
+#    }
+#    close DISTANCE;
+#}
+
+#### Subroutin to printout pairwise distance for each gene ########
+
+sub printPairDistance{
+
+    my(%pair_distance)=%{(shift)};
+    my($output_dir)=(shift);
+    my($genome_name)=(shift);
+
+    open(PAIR_DISTANCE,">$output_dir/pairwise_distance.txt");
+
+    foreach my $group_id(sort {$a cmp $b} keys %pair_distance){
+
+            my $ref_geneA=$pair_distance{$group_id};
+            my %geneA_hash=%{$ref_geneA};
+
+        foreach my $geneA_id(keys %geneA_hash){
+
+            my $ref_geneB=$geneA_hash{$geneA_id};
+            my %geneB_hash=%{$ref_geneB};
+
+            foreach my $geneB_id(keys %geneB_hash){
+
+                my $distance_value=$geneB_hash{$geneB_id};
+                print PAIR_DISTANCE "$group_id\t$geneA_id\t$geneB_id\t$distance_value\n";
+            }
+
+        }          
+
+    }
+
+    close PAIR_DISTANCE;
+}
+
+##### Subroutin to read cluster file ##############
+
+sub readCluster {
+
+    my($cluster_file)=(shift);
+    my($genome_name)=(shift);
+    my(%homologue_group)=();
+    my $genome_status=0;
+
+    open(GROUP_OUT,"$cluster_file") or die "Cannot open the cluster file $cluster_file\n";
+
+    foreach(<GROUP_OUT>){
+
+          chomp($_);
+
+          if($_=~/$genome_name/){
+
+             $genome_status=1;
+             last;
+          }
+      
+          $_=~/^(\w+)(\:)(\t)(.+)/;
+          my $group_line=$4;
+          my $group_id=$1;
+          $group_line=~s/\t$//g;   
+          $homologue_group{$group_id}=$group_line;            
+    }
+
+    return(\%homologue_group,$genome_status);
+}
+
+##### Subroutin to add Group Id to MCL Output #####
+
+sub addGroupID {
+
+    my($mcl_output)=(shift);
+    my($cluster_num)=(shift);
+    my($hmm_program)=(shift);
+    my(%homologue_group)=%{(shift)};
+    my(%group_for_query)=();
+
+    my $group_file="$out_dir{cluster_dir}/Cluster_$cluster_num.txt";
+
+    open(MCL_OUT,"$out_dir{mcl_dir}/$mcl_output");
+
+    open(GROUP_OUT,">$group_file");
+   
+    if($hmm_program eq "phmmer"){
+    
+        my $id_counter=1000;
+        my $prefix="Group";
+
+        foreach my $group_line(<MCL_OUT>){
+               chomp($group_line);
+               my $group_id=$prefix.$id_counter;       
+               $homologue_group{$group_id}=$group_line;
+               $group_for_query{$group_id}=$group_line;
+               $id_counter++;
+        }
+
+    }elsif($hmm_program eq "hmmscan"){
+
+        my $id_counter=keys(%homologue_group) + 1000;
+        my $prefix="Group";
+
+        foreach my $group_line(<MCL_OUT>){
+
+                chomp($group_line);
+
+                if($group_line=~/(Group\d+)/){
+                  
+                    $group_line=~/(Group\d+)/;
+                    my $group_id=$1;                    
+                    $group_line=~s/(Group\d+)(\t*)//g;
+                    $group_line=~s/\t$//g;
+                    $group_line=$homologue_group{$group_id}."\t".$group_line;
+                    $homologue_group{$group_id}=$group_line;
+                    $group_for_query{$group_id}=$group_line;
+                 }
+                 else{                    
+                    my $group_id=$prefix.$id_counter; 
+                    $group_line=~s/\t$//g;
+                    $homologue_group{$group_id}=$group_line;
+                    $group_for_query{$group_id}=$group_line;
+                    $id_counter++;
+                 }
+        }      
+
+   }
+
+   ####### Print Cluster Group #######
+
+   foreach(sort{$a cmp $b}keys %homologue_group){
+      print GROUP_OUT "$_:\t$homologue_group{$_}\n";
+   }
+   
+   close GROUP_OUT;
+   close MCL_OUT;  
+   undef %homologue_group;
+   return($group_file,\%group_for_query);
+}
+
+
+##### Subroutin to perform MCL CLUSTERING #####
+
+sub mclClustering {
+
+    my($similarity_file)=(shift);
+    my($mcl_output)='';
+
+    print STDOUT "MCL CLUSTERING\n";
+    system("cut -f 1,2,11 $out_dir{mcl_dir}/$similarity_file > $out_dir{mcl_dir}/mcxload_input.abc");
+    chdir($mcl);
+    system("./mcxload -abc $bin/$out_dir{mcl_dir}/mcxload_input.abc --stream-mirror --stream-neg-log10 -stream-tf 'ceil(200)' -o $bin/$out_dir{mcl_dir}/mcl_input.mci -write-tab $bin/$out_dir{mcl_dir}/mcl_input.tab");
+    system("./mcl $bin/$out_dir{mcl_dir}/mcl_input.mci -I 1.5 -use-tab $bin/$out_dir{mcl_dir}/mcl_input.tab -o $bin/$out_dir{mcl_dir}/mcl_output");
+    $mcl_output="mcl_output";
+    chdir($bin);
+   
+    return($mcl_output);
+}
+
+
+##### Subroutin To Build Output Directory Structure #####
+
+sub buildOutputDir {
+
+    my($project_name)=(shift);
+    my(%analysis)=%{(shift)};
+
+    print STDOUT "BUILD PROJECT DIRECTORY for $project_name\n"; 
+    
+    my $project_dir="$output/$project_name";                            $out_dir{project_name}=$project_dir;
+
+    mkdir($project_dir);
+    
+    #### Make directory for analysis turned on in configuration file #####    
+
+    if($analysis{HOMOLOG_SCAN}=~/(YES)/i){
+       
+       my $homolog_dir="$output/$project_name/HOMOLOG_SCAN";            $out_dir{homolog_dir}=$homolog_dir;
+       my $seed_dir="$homolog_dir/GROUP";                               $out_dir{seed_dir}=$seed_dir;
+       my $similarity_dir="$homolog_dir/BEST_PAIR";                     $out_dir{similarity_dir}=$similarity_dir;
+       my $all_similarity_dir="$homolog_dir/ALL_PAIR";                  $out_dir{all_similarity_dir}=$all_similarity_dir;
+       my $mcl_dir="$homolog_dir/MCL";                                  $out_dir{mcl_dir}=$mcl_dir;
+       my $aln_dir="$seed_dir/ALIGNMENT";                               $out_dir{aln_dir}=$aln_dir;
+       my $seq_dir="$seed_dir/FASTA";                                   $out_dir{seq_dir}=$seq_dir;     
+       my $hmm_dir="$seed_dir/HMM";                                     $out_dir{hmm_dir}=$hmm_dir;
+       my $distance_file="$seed_dir/DISTANCE";                          $out_dir{distance_file}=$distance_file;
+       my $cluster_dir="$seed_dir/CLUSTER";                             $out_dir{cluster_dir}=$cluster_dir;
+       my $hmm_file_dir="$hmm_dir/MODEL";                               $out_dir{hmm_file_dir}=$hmm_file_dir;
+       my $singleton_group="$hmm_dir/SINGLETON";                        $out_dir{singleton_group}=$singleton_group;
+       my $hmm_db_dir="$hmm_dir/HMM_DB";                                $out_dir{hmm_db_dir}=$hmm_db_dir;
+       my $domain_model="$hmm_dir/domain_model";                        $out_dir{domain_model}=$domain_model;
+       my $hmm_out_dir="$homolog_dir/HMMER_OUT";                        $out_dir{hmm_out_dir}=$hmm_out_dir;
+       my $hmm_fullout_dir="$hmm_out_dir/HMM_FULL";                     $out_dir{hmm_fullout_dir}=$hmm_fullout_dir;
+       my $hmm_tblout_dir="$hmm_out_dir/HMM_TBL";                       $out_dir{hmm_tblout_dir}=$hmm_tblout_dir;
+       my $hmm_domout_dir="$hmm_out_dir/HMM_DOM";                       $out_dir{hmm_domout_dir}=$hmm_domout_dir;                             
+       my $tmp_log="$output/$project_name/LOG";                         $out_dir{tmp_log}=$tmp_log;
+    
+       mkdir($homolog_dir);
+       mkdir($seed_dir);
+       mkdir($similarity_dir);
+       mkdir($all_similarity_dir);
+       mkdir($mcl_dir);
+       mkdir($aln_dir);
+       mkdir($seq_dir);
+       mkdir($cluster_dir);
+       mkdir($distance_file);
+       mkdir($hmm_out_dir);
+       mkdir($hmm_fullout_dir);
+       mkdir($hmm_tblout_dir);
+       mkdir($hmm_domout_dir);
+       mkdir($hmm_dir);
+       mkdir($hmm_file_dir);
+       mkdir($singleton_group);
+       mkdir($hmm_db_dir);
+       mkdir($tmp_log);
+    }  
+   
+}
+   
+
+

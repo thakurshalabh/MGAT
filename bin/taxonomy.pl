@@ -1,0 +1,34 @@
+#!/usr/bin/perl -w
+use strict;
+use Bio::DB::Taxonomy;
+ 
+my $idx_dir = './';
+ 
+my ($nodefile,$namesfile) = ('nodes.dmp','names.dmp');
+my $db = new Bio::DB::Taxonomy(-source    => 'entrez');
+my $taxon_id='205918';
+GET_ANCESTOR:
+my $node = $db->get_taxon(-taxonid => $taxon_id);
+print $node->id, " ", $node->scientific_name, " ", $node->rank, "\n";
+# to only get children that are of a particular rank in the taxonomy test if their rank is 'species' for example
+
+
+my @extant_children = $db->ancestor($node);
+
+if(@extant_children ne ''){
+
+  for my $child ( @extant_children ) {
+    if($child->scientific_name eq "cellular organisms"){
+      exit;
+    }
+    print "id is ", $child->id, "\n"; # NCBI taxa id
+    print "rank is ", $child->rank, "\n"; # e.g. species
+    print "scientific name is ", $child->scientific_name, "\n"; # scientific name
+    $taxon_id=$child->id;
+  }  
+  goto GET_ANCESTOR;
+}
+ 
+
+
+

@@ -1,0 +1,266 @@
+#!/usr/bin/perl -w
+###### ABOUT: This Script is the main controller for the execution of MGAT Package ############
+###### AUTHOR:Shalabh Thakur###################################################################
+###### DATE:15-MAY-2013########################################################################
+
+use strict;
+use warnings;
+use Env;
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use Configuration;
+use AdjustSequence;
+use SequenceHash;
+use Hmmer;
+use CompareReference;
+use FilterPair;
+use SelectModelGene;
+use CreateModel;
+use HomologScan;
+use Getopt::Long;
+use List::MoreUtils qw(uniq);
+use List::Util qw(sum);
+use File::Basename;
+use File::Copy;
+use File::Path qw(remove_tree);
+use Parallel::ForkManager;
+use Hash::Merge qw( merge );
+
+
+##### DECLARE INPUT VARIABLE #####
+
+my $configuration_file=undef;
+my $project_name=undef;
+my $help=undef;
+
+##### SET ENVIRONMENTAL VARIABLE #####
+
+$ENV{$HOME}=$Bin;
+
+##### DEFINE DIRECTORIES #####
+
+my $bin=$Bin;
+my $config="../config";
+my $data="../data";
+my $inseq_dir="../sequence";
+my $output="../output";
+my $tmp="/tmp";            ### System folder ###
+my $log="../log";
+my $exe="../exe";
+
+
+##### APPLICATION #####
+
+my $mcl="$exe/mcl/bin";
+my $muscle="$exe/muscle";
+my $protdist="$exe/protdist";
+my $hmmer="$exe/hmmer";
+my $fasttree="$exe/FastTree";
+
+##### DECLARE GLOBAL VARIABLE #####
+
+my %config_param=();
+my %query_genome=();
+my %reference_genome=();
+my %out_dir=();
+my %seq_id_table=();
+my %seq_len_table=();
+my %sequence=();
+my %group_gene=();
+my %pair_distance=();
+my %homologue_group=();
+my %average_dist_group=();
+my %total_dist_group=();
+my %count_pair_group=();
+my %model_gene=();
+my %aligned=();
+my @query_file=();
+my @reference_file=();
+my $cluster_num=1;
+my $cluster_file='';
+my $hmm_program='';
+my $group_for_query={};
+my $jump_to_step=0;
+
+##### READ COMMAND LINE INPUT VARIABLES #####
+
+GetOptions('config=s'  =>  \$configuration_file,
+           'project=s' =>  \$project_name,
+           'help=s'    =>  \$help
+          );
+
+##### SHOW HELP #####
+if(defined($help)){
+   showHelp();
+   exit;
+}
+
+sub showHelp {
+
+   print STDOUT "Program: Microbial Genome analysis Toolkit\n",
+                "Author:  Shalabh Thakur\n",
+                "Version: 1.0\n\n";
+
+   print STDOUT "[Mandatory Parameters]\n",
+                "-config: This parameters take MGAT configuration file name as input.",
+                "By Default configuration file would be searched in config folder of Home directory. ",
+                "If configuration file is locted in another directory, than change the url of config dir",
+                "in the script.\n\n";
+
+   print STDOUT "[Optional Parameters]\n",
+                "-project: Name of existing project directory\n",
+                "-help: Give information on available options\n";
+   
+}
+
+#### CALL MAIN ####
+main();
+
+
+#### MAIN Subroutin ######
+sub main {
+
+    unless(defined($configuration_file)){
+      print STDERR "Error: Configuration file name not found\n";
+    }
+
+    ##### Read Configuration File #####
+    print STDOUT "READ CONFIGURATION FILE\n";
+    $configuration_file="$config/$configuration_file"; 
+    %config_param=Configuration::getConfig($configuration_file);
+
+    ##### Create New Project #####
+
+    if(!defined($project_name)) {
+	my @timedata = localtime();
+	   $timedata[5] += 1900;
+	   $timedata[4] += 1;
+	   $project_name=$timedata[0].$timedata[1].$timedata[2].$timedata[3].$timedata[4].$timedata[5];
+	   $project_name="Project_".$project_name;	
+    } 
+
+    ##### Create Directory Structure #####
+
+    buildOutputDir($project_name,$config_param{ACTIVATE_ANALYSIS});   
+    
+    ##### Adjust Sequences by adding genome_name tag to each sequence ID (Genome_Name|Sequence_ID) #####
+
+    print STDOUT "ADJUST SEQUENCES IN QUERY DIRECTORY\n";
+
+    opendir(Qseq_dir,$config_param{SEQUENCE_DIRECTORY}->{QUERY_DIR}) or die "Cannot open directory\n";
+    @query_file=readdir(Qseq_dir);
+    my @tmp_query=@query_file;
+    %query_genome=map{$_=>$_}@tmp_query;
+
+    AdjustSequence::checkSequence($config_param{SEQUENCE_DIRECTORY}->{QUERY_DIR},
+                                  $config_param{SEQUENCE}->{SEQ_FORMAT},
+                                  $config_param{SEQUENCE}->{ADJUST_HEADER},
+                                  $inseq_dir,\@query_file);
+    
+
+    print STDOUT "ADJUST SEQUENCES IN REFERENCE DIRECTORY\n";
+
+    opendir(Rseq_dir,$config_param{SEQUENCE_DIRECTORY}->{REFERENCE_DIR}) or die "Cannot open directory\n";
+    @reference_file=readdir(Rseq_dir);
+    my @tmp_reference=@reference_file;
+    %reference_genome=map{$_=>$_}@tmp_reference;
+
+    AdjustSequence::checkSequence($config_param{SEQUENCE_DIRECTORY}->{REFERENCE_DIR},
+                                  $config_param{SEQUENCE}->{SEQ_FORMAT},
+                                  $config_param{SEQUENCE}->{ADJUST_HEADER},
+                                  $inseq_dir,\@reference_file);
+
+
+    ###### READ SEQUENCE FEATURES: SEQUENCE , SEQUENCE_ID, SEQEUNCE_LENGTH ######
+    my ($SequenceLenHashTable,$SequenceIDHashTable,$SequenceHash)=SequenceHash::getSequenceFeature($inseq_dir);
+
+    %seq_len_table=%{$SequenceLenHashTable};
+    %seq_id_table=%{$SequenceIDHashTable};
+    %sequence=%{$SequenceHash};
+  
+    #### Number of parallel Process #####
+    my $process=$config_param{PARALLEL_PROCESS}->{MAX_PROCESS};
+
+    ####################### LOAD TAXONOMY IN SQL TABLE ##########
+
+    ####################### HOMOLOG SCAN ####################
+
+    HomologScan::run_homolog_scan(\%config_param,\%out_dir,\%sequence,\%seq_len_table,\%seq_id_table,$inseq_dir,\@reference_file,\@query_file,\%reference_genome,$hmmer,$mcl,$protdist,$muscle,$process,$tmp);              
+    
+}
+
+##### Subroutin To Build Output Directory Structure #####
+
+sub buildOutputDir {
+
+    my($project_name)=(shift);
+    my(%analysis)=%{(shift)};
+
+    print STDOUT "BUILD PROJECT DIRECTORY for $project_name\n"; 
+    
+    my $project_dir="$output/$project_name";                            $out_dir{project_name}=$project_dir;
+
+    mkdir($project_dir);
+    
+    #### Make directory for analysis turned on in configuration file #####    
+
+    if($analysis{HOMOLOG_SCAN}=~/(YES)/i){
+       
+       my $homolog_dir="$output/$project_name/HOMOLOG_SCAN";            $out_dir{homolog_dir}=$homolog_dir;
+       my $ortholog_dir="$homolog_dir/ORTHOLOG";                        $out_dir{ortholog_dir}=$ortholog_dir;
+       my $pair_distance="$ortholog_dir/PAIR_DISTANCE";                 $out_dir{pair_distance}=$pair_distance;
+       my $ortholog_cluster="$ortholog_dir/ORTHO_CLUSTER";              $out_dir{ortholog_cluster}=$ortholog_cluster;
+       my $ortholog_pair="$ortholog_dir/PAIR_ORTHOLOG";                 $out_dir{pair_ortholog}=$ortholog_pair;
+       my $inparalog_pair="$ortholog_dir/PAIR_INPARALOG";               $out_dir{pair_inparalog}=$inparalog_pair;
+       my $incongruent_pair="$ortholog_dir/PAIR_INCONGRUENT";           $out_dir{pair_incongruent}=$incongruent_pair;
+       my $seed_dir="$homolog_dir/SEED";                                $out_dir{seed_dir}=$seed_dir;
+       my $similarity_dir="$homolog_dir/BEST_PAIR";                     $out_dir{similarity_dir}=$similarity_dir;
+       my $all_similarity_dir="$homolog_dir/ALL_PAIR";                  $out_dir{all_similarity_dir}=$all_similarity_dir;
+       my $chimeric_similarity_dir="$homolog_dir/CHIMERA";              $out_dir{chimeric_similarity_dir}=$chimeric_similarity_dir;
+       my $mcl_dir="$homolog_dir/MCL";                                  $out_dir{mcl_dir}=$mcl_dir;
+       my $aln_dir="$seed_dir/ALIGNMENT";                               $out_dir{aln_dir}=$aln_dir;
+       my $seq_dir="$seed_dir/FASTA";                                   $out_dir{seq_dir}=$seq_dir;     
+       my $hmm_dir="$seed_dir/HMM";                                     $out_dir{hmm_dir}=$hmm_dir;
+       my $distance_file="$seed_dir/DISTANCE";                          $out_dir{distance_file}=$distance_file;
+       my $cluster_dir="$seed_dir/CLUSTER";                             $out_dir{cluster_dir}=$cluster_dir;
+       my $hmm_file_dir="$hmm_dir/MODEL";                               $out_dir{hmm_file_dir}=$hmm_file_dir;
+       my $singleton_group="$hmm_dir/SINGLETON";                        $out_dir{singleton_group}=$singleton_group;
+       my $hmm_db_dir="$hmm_dir/HMM_DB";                                $out_dir{hmm_db_dir}=$hmm_db_dir;
+       my $domain_model="$hmm_dir/domain_model";                        $out_dir{domain_model}=$domain_model;
+       my $hmm_out_dir="$homolog_dir/HMMER_OUT";                        $out_dir{hmm_out_dir}=$hmm_out_dir;
+       my $hmm_fullout_dir="$hmm_out_dir/HMM_FULL";                     $out_dir{hmm_fullout_dir}=$hmm_fullout_dir;
+       my $hmm_tblout_dir="$hmm_out_dir/HMM_TBL";                       $out_dir{hmm_tblout_dir}=$hmm_tblout_dir;
+       my $hmm_domout_dir="$hmm_out_dir/HMM_DOM";                       $out_dir{hmm_domout_dir}=$hmm_domout_dir;                             
+       my $tmp_log="$output/$project_name/LOG";                         $out_dir{tmp_log}=$tmp_log;
+    
+       mkdir($homolog_dir);
+       mkdir($ortholog_dir);
+       mkdir($pair_distance);
+       mkdir($ortholog_cluster);
+       mkdir($ortholog_pair);
+       mkdir($inparalog_pair);
+       mkdir($incongruent_pair);
+       mkdir($seed_dir);
+       mkdir($similarity_dir);
+       mkdir($all_similarity_dir);
+       mkdir($chimeric_similarity_dir);
+       mkdir($mcl_dir);
+       mkdir($aln_dir);
+       mkdir($seq_dir);
+       mkdir($cluster_dir);
+       mkdir($distance_file);
+       mkdir($hmm_out_dir);
+       mkdir($hmm_fullout_dir);
+       mkdir($hmm_tblout_dir);
+       mkdir($hmm_domout_dir);
+       mkdir($hmm_dir);
+       mkdir($hmm_file_dir);
+       mkdir($singleton_group);
+       mkdir($hmm_db_dir);
+       mkdir($tmp_log);
+    }
+   
+}
+   
+
+
